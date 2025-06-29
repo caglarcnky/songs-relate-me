@@ -1,10 +1,14 @@
 import os
 import uuid
 from urllib.parse import urlencode
-
-from flask import Flask, request, redirect, session, jsonify
+import uvicorn
+from fastapi import FastAPI, Request, Response, Depends, HTTPException
+from fastapi.responses import RedirectResponse, JSONResponse, PlainTextResponse
+from starlette.middleware.sessions import SessionMiddleware
 import requests
 from dotenv import load_dotenv
+from pydantic import BaseModel, Field
+from typing import List, Optional
 
 load_dotenv()
 
@@ -16,9 +20,8 @@ AUTH_URL = "https://accounts.spotify.com/authorize"
 TOKEN_URL = "https://accounts.spotify.com/api/token"
 API_BASE = "https://api.spotify.com/v1"
 
-app = Flask(__name__)
-app.secret_key = os.urandom(24)
-
+app = FastAPI()
+app.add_middleware(SessionMiddleware, secret_key=os.urandom(24))
 
 # Simple placeholder recommendation function
 # In a real application this would use conversation history and an LLM
@@ -29,19 +32,26 @@ def recommend_songs(history: str):
         "spotify:track:7GhIk7Il098yCjg4BQjzvb",  # Take on Me
     ]
 
+class RecommendRequest(BaseModel):
+    history: str = Field(..., example="I want to listen to 80s pop music")
 
-@app.route("/recommend", methods=["POST"])
-def recommend_endpoint():
-    data = request.get_json() or {}
-    history = data.get("history", "")
+class CreatePlaylistRequest(BaseModel):
+    songs: List[str] = Field(..., example=[
+        "spotify:track:4uLU6hMCjMI75M1A2tKUQC",
+        "spotify:track:7GhIk7Il098yCjg4BQjzvb"
+    ])
+
+@app.post("/recommend")
+async def recommend_endpoint(body: RecommendRequest, request: Request):
+    history = body.history
     songs = recommend_songs(history)
-    return jsonify({"songs": songs})
+    return {"songs": songs}
 
 
-@app.route("/authorize")
-def authorize():
+@app.get("/authorize")
+async def authorize(request: Request):
     state = uuid.uuid4().hex
-    session["state"] = state
+    request.session["state"] = state
     params = {
         "client_id": SPOTIFY_CLIENT_ID,
         "response_type": "code",
@@ -49,15 +59,16 @@ def authorize():
         "state": state,
         "scope": "playlist-modify-private playlist-modify-public",
     }
-    return redirect(f"{AUTH_URL}?{urlencode(params)}")
+    url = f"{AUTH_URL}?{urlencode(params)}"
+    return RedirectResponse(url)
 
 
-@app.route("/callback")
-def callback():
-    code = request.args.get("code")
-    state = request.args.get("state")
-    if state != session.get("state"):
-        return "State mismatch", 400
+@app.get("/callback")
+async def callback(request: Request):
+    code = request.query_params.get("code")
+    state = request.query_params.get("state")
+    if state != request.session.get("state"):
+        return PlainTextResponse("State mismatch", status_code=400)
 
     resp = requests.post(
         TOKEN_URL,
@@ -70,8 +81,8 @@ def callback():
         },
     )
     token_info = resp.json()
-    session["access_token"] = token_info.get("access_token")
-    return "Authentication successful. You may close this window."  # noqa: E501
+    request.session["access_token"] = token_info.get("access_token")
+    return PlainTextResponse("Authentication successful. You may close this window.")
 
 
 def get_user_id(token: str) -> str:
@@ -93,7 +104,6 @@ def create_playlist(token: str, user_id: str, name: str) -> str:
     )
     return resp.json().get("id")
 
-
 def add_tracks(token: str, playlist_id: str, tracks):
     requests.post(
         f"{API_BASE}/playlists/{playlist_id}/tracks",
@@ -105,22 +115,18 @@ def add_tracks(token: str, playlist_id: str, tracks):
     )
 
 
-@app.route("/create_playlist", methods=["POST"])
-def create_playlist_endpoint():
-    token = session.get("access_token")
+@app.post("/create_playlist")
+async def create_playlist_endpoint(body: CreatePlaylistRequest, request: Request):
+    token = request.session.get("access_token")
     if not token:
-        return jsonify({"error": "Not authenticated"}), 401
-
-    data = request.get_json() or {}
-    tracks = data.get("songs")
+        return JSONResponse({"error": "Not authenticated"}, status_code=401)
+    tracks = body.songs
     if not tracks:
-        return jsonify({"error": "No songs provided"}), 400
-
+        return JSONResponse({"error": "No songs provided"}, status_code=400)
     user_id = get_user_id(token)
     playlist_id = create_playlist(token, user_id, "ChatGPT Recommendations")
     add_tracks(token, playlist_id, tracks)
-    return jsonify({"playlist_id": playlist_id})
-
+    return {"playlist_id": playlist_id}
 
 if __name__ == "__main__":
-    app.run(debug=True)
+    uvicorn.run(app, host="0.0.0.0", port=8020)
